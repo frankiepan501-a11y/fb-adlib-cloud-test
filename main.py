@@ -1,4 +1,6 @@
-"""Minimal Playwright test: scrape Facebook Ad Library from Zeabur cloud IP."""
+"""Minimal Playwright test: scrape Facebook Ad Library from Zeabur cloud IP.
+Uses the EXACT same JS extraction logic as production fb_ad_library_scraper.py.
+"""
 import os, time, json
 from fastapi import FastAPI, HTTPException, Header
 from playwright.sync_api import sync_playwright
@@ -19,9 +21,6 @@ def scrape_ad_library(brand_name: str, country: str = 'ALL', max_ads: int = 10):
         ctx = browser.new_context(
             viewport={'width': 1920, 'height': 1080},
             locale='zh-CN',
-            user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/130.0.0.0 Safari/537.36'),
         )
         page = ctx.new_page()
         try:
@@ -33,24 +32,30 @@ def scrape_ad_library(brand_name: str, country: str = 'ALL', max_ads: int = 10):
         debug['title'] = page.title()
         body_html = page.content()
         debug['body_len'] = len(body_html)
+        # Stronger anti-bot signal detection (excludes captcha which appears in FB JS bundles)
         debug['has_challenge'] = any(
             k in body_html.lower() for k in
-            ['cloudflare', 'just a moment', 'captcha', 'datadome',
+            ['cloudflare', 'just a moment', 'datadome',
              'access denied', 'unusual traffic']
         )
-        debug['has_login_wall'] = '请登录' in body_html or 'log in to facebook' in body_html.lower() or 'You must log in' in body_html
+        debug['has_login_wall'] = (
+            '请登录' in body_html or
+            'log in to facebook' in body_html.lower() or
+            'You must log in' in body_html
+        )
+        # Count scontent images on page for diagnosis
+        debug['scontent_img_total'] = body_html.count('scontent')
 
         for _ in range(min(max_ads // 5 + 1, 5)):
             page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
             time.sleep(2)
 
+        # Production-equivalent JS extraction (1:1 with fb_ad_library_scraper.py)
         ads = page.evaluate("""(maxAds) => {
             const results = [];
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-                acceptNode: (node) => (
-                    node.textContent.includes('资料库编号') ||
-                    node.textContent.includes('Library ID')
-                ) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+                acceptNode: (node) => node.textContent.includes('资料库编号')
+                    ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
             });
             const adNodes = [];
             while (walker.nextNode()) {
@@ -63,31 +68,61 @@ def scrape_ad_library(brand_name: str, country: str = 'ALL', max_ads: int = 10):
             for (const container of adNodes.slice(0, maxAds)) {
                 const text = container.innerText || '';
                 const ad = {};
-                const idMatch = text.match(/(?:资料库编号|Library ID)[：:]\\s*(\\d+)/);
+                const idMatch = text.match(/资料库编号[：:]\\s*(\\d+)/);
                 ad.id = idMatch ? idMatch[1] : '';
+                const dateMatch = text.match(/(\\d{4}年\\d{1,2}月\\d{1,2}日)开始投放/);
+                ad.startDate = dateMatch ? dateMatch[1] : '';
                 const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
                 let advertiser = '';
+                let bodyStart = -1;
                 for (let i = 0; i < lines.length; i++) {
                     if (lines[i] === '赞助内容' || lines[i] === 'Sponsored') {
                         for (let j = i - 1; j >= Math.max(i - 5, 0); j--) {
                             const c = lines[j];
-                            if (c && c !== '​' && !c.includes('查看') && c.length > 1 && c.length < 100) {
+                            if (c && c !== '​' && !c.includes('查看') && !c.includes('打开') &&
+                                !c.includes('平台') && !c.includes('资料库') && !c.includes('投放') &&
+                                !c.includes('条广告') && c.length > 1 && c.length < 100) {
                                 advertiser = c; break;
                             }
                         }
-                        break;
+                        bodyStart = i + 1; break;
                     }
                 }
                 ad.pageName = advertiser;
-                const imgs = container.querySelectorAll('img');
+                ad.body = '';
+                if (bodyStart > 0) {
+                    const bodyLines = [];
+                    for (let i = bodyStart; i < Math.min(bodyStart + 15, lines.length); i++) {
+                        const line = lines[i];
+                        if (!line || line === '​') continue;
+                        if (line.includes('资料库编号')) break;
+                        bodyLines.push(line);
+                    }
+                    ad.body = bodyLines.join('\\n');
+                }
+                // Image extraction (production logic)
+                const containerImgs = container.querySelectorAll('img');
                 ad.images = [];
-                for (const img of imgs) {
+                ad.imgs_diag = [];
+                for (const img of containerImgs) {
+                    ad.imgs_diag.push({
+                        src_has_scontent: !!(img.src && img.src.includes('scontent')),
+                        natural_width: img.naturalWidth,
+                        complete: img.complete,
+                        loading: img.loading,
+                    });
                     if (img.src && img.src.includes('scontent') && img.naturalWidth > 80) {
                         ad.images.push(img.src);
                     }
                 }
-                ad.hasVideo = container.querySelectorAll('video').length > 0;
-                if (ad.pageName || ad.id) results.push(ad);
+                const containerVids = container.querySelectorAll('video');
+                ad.hasVideo = containerVids.length > 0;
+                if (containerVids.length > 0) {
+                    for (const vid of containerVids) {
+                        if (vid.poster && vid.poster.includes('scontent')) ad.images.push(vid.poster);
+                    }
+                }
+                if (ad.pageName || ad.body) results.push(ad);
             }
             return results;
         }""", max_ads)
