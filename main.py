@@ -16,7 +16,12 @@ def scrape_ad_library(brand_name: str, country: str = 'ALL', max_ads: int = 10):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+            args=[
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--autoplay-policy=no-user-gesture-required',
+                '--disable-features=IsolateOrigins,site-per-process',
+            ],
         )
         ctx = browser.new_context(
             viewport={'width': 1920, 'height': 1080},
